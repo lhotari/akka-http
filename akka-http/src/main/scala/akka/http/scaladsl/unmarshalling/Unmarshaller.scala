@@ -5,13 +5,13 @@
 package akka.http.scaladsl.unmarshalling
 
 import akka.event.Logging
-import akka.stream.Materializer
-
-import scala.util.control.{ NoStackTrace, NonFatal }
-import scala.concurrent.{ Future, ExecutionContext }
+import akka.http.scaladsl.model._
 import akka.http.scaladsl.util.FastFuture
 import akka.http.scaladsl.util.FastFuture._
-import akka.http.scaladsl.model._
+import akka.stream.Materializer
+
+import scala.concurrent.{ ExecutionContext, Future }
+import scala.util.control.{ NoStackTrace, NonFatal }
 
 trait Unmarshaller[-A, B] extends akka.http.javadsl.unmarshalling.Unmarshaller[A, B] {
 
@@ -35,7 +35,9 @@ trait Unmarshaller[-A, B] extends akka.http.javadsl.unmarshalling.Unmarshaller[A
     transform(implicit ec ⇒ mat ⇒ _.fast recover pf(ec)(mat))
 
   def withDefaultValue[BB >: B](defaultValue: BB): Unmarshaller[A, BB] =
-    recover(_ ⇒ _ ⇒ { case Unmarshaller.NoContentException ⇒ defaultValue })
+    recover(_ ⇒ _ ⇒ {
+      case Unmarshaller.NoContentException ⇒ defaultValue
+    })
 }
 
 object Unmarshaller
@@ -47,8 +49,8 @@ object Unmarshaller
 
   //#unmarshaller-creation
   /**
-   * Creates an `Unmarshaller` from the given function.
-   */
+    * Creates an `Unmarshaller` from the given function.
+    */
   def apply[A, B](f: ExecutionContext ⇒ A ⇒ Future[B]): Unmarshaller[A, B] =
     withMaterializer(ec => _ => f(ec))
 
@@ -56,29 +58,35 @@ object Unmarshaller
     new Unmarshaller[A, B] {
       def apply(a: A)(implicit ec: ExecutionContext, materializer: Materializer) =
         try f(ec)(materializer)(a)
-        catch { case NonFatal(e) ⇒ FastFuture.failed(e) }
+        catch {
+          case NonFatal(e) ⇒ FastFuture.failed(e)
+        }
     }
 
   /**
-   * Helper for creating a synchronous `Unmarshaller` from the given function.
-   */
+    * Helper for creating a synchronous `Unmarshaller` from the given function.
+    */
   def strict[A, B](f: A ⇒ B): Unmarshaller[A, B] = Unmarshaller(_ => a ⇒ FastFuture.successful(f(a)))
 
   /**
-   * Helper for creating a "super-unmarshaller" from a sequence of "sub-unmarshallers", which are tried
-   * in the given order. The first successful unmarshalling of a "sub-unmarshallers" is the one produced by the
-   * "super-unmarshaller".
-   */
+    * Helper for creating a "super-unmarshaller" from a sequence of "sub-unmarshallers", which are tried
+    * in the given order. The first successful unmarshalling of a "sub-unmarshallers" is the one produced by the
+    * "super-unmarshaller".
+    */
   def firstOf[A, B](unmarshallers: Unmarshaller[A, B]*): Unmarshaller[A, B] = //...
   //#unmarshaller-creation
-    Unmarshaller.withMaterializer { implicit ec ⇒ implicit mat => a ⇒
-      def rec(ix: Int, supported: Set[ContentTypeRange]): Future[B] =
-        if (ix < unmarshallers.size) {
-          unmarshallers(ix)(a).fast.recoverWith {
-            case Unmarshaller.UnsupportedContentTypeException(supp) ⇒ rec(ix + 1, supported ++ supp)
-          }
-        } else FastFuture.failed(Unmarshaller.UnsupportedContentTypeException(supported))
-      rec(0, Set.empty)
+    Unmarshaller.withMaterializer { implicit ec ⇒
+      implicit mat =>
+        a ⇒
+          def rec(ix: Int, supported: Set[ContentTypeRange], contentType: Option[ContentType]): Future[B] =
+            if (ix < unmarshallers.size) {
+              unmarshallers(ix)(a).fast.recoverWith {
+                case UnsupportedContentTypeException(supp, actualType) ⇒
+                  rec(ix + 1, supported ++ supp, contentType.orElse(actualType))
+              }
+            } else FastFuture.failed(UnsupportedContentTypeException(supported, contentType))
+
+          rec(0, Set.empty, None)
     }
 
   // format: ON
@@ -111,14 +119,14 @@ object Unmarshaller
         entity ⇒
           if (entity.contentType == ContentTypes.NoContentType || ranges.exists(_ matches entity.contentType)) {
             underlying(entity).fast.recover[A](barkAtUnsupportedContentTypeException(ranges, entity.contentType))
-          } else FastFuture.failed(UnsupportedContentTypeException(ranges: _*))
+          } else FastFuture.failed(UnsupportedContentTypeException(Some(entity.contentType), ranges: _*))
       }
 
     private def barkAtUnsupportedContentTypeException(
       ranges:         Seq[ContentTypeRange],
       newContentType: ContentType): PartialFunction[Throwable, Nothing] = {
-      case UnsupportedContentTypeException(supported) ⇒ throw new IllegalStateException(
-        s"Illegal use of `unmarshaller.forContentTypes($ranges)`: $newContentType is not supported by underlying marshaller!")
+      case UnsupportedContentTypeException(supported, _) ⇒ throw new IllegalStateException(
+        s"Illegal use of `unmarshaller.forContentTypes($ranges)`: Content-Type [$newContentType] is not supported by underlying marshaller!")
     }
   }
 
@@ -137,14 +145,6 @@ object Unmarshaller
    */
   case object NoContentException extends RuntimeException("Message entity must not be empty") with NoStackTrace
 
-  /**
-   * Signals that unmarshalling failed because the entity content-type did not match one of the supported ranges.
-   * This error cannot be thrown by custom code, you need to use the `forContentTypes` modifier on a base
-   * [[akka.http.scaladsl.unmarshalling.Unmarshaller]] instead.
-   */
-  final case class UnsupportedContentTypeException(supported: Set[ContentTypeRange])
-    extends RuntimeException(supported.mkString("Unsupported Content-Type, supported: ", ", ", ""))
-
   /** Order of parameters (`right` first, `left` second) is intentional, since that's the order we evaluate them in. */
   final case class EitherUnmarshallingException(
     rightClass: Class[_], right: Throwable,
@@ -154,7 +154,45 @@ object Unmarshaller
         s"Right failure: ${right.getMessage}, " +
         s"Left failure: ${left.getMessage}")
 
-  object UnsupportedContentTypeException {
-    def apply(supported: ContentTypeRange*): UnsupportedContentTypeException = UnsupportedContentTypeException(Set(supported: _*))
+  /**
+   * Signals that unmarshalling failed because the entity content-type did not match one of the supported ranges.
+   * This error cannot be thrown by custom code, you need to use the `forContentTypes` modifier on a base
+   * [[akka.http.scaladsl.unmarshalling.Unmarshaller]] instead.
+   */
+  final case class UnsupportedContentTypeException(
+    supported:         Set[ContentTypeRange],
+    actualContentType: Option[ContentType])
+    extends RuntimeException(supported.mkString(
+      s"Unsupported Content-Type [$actualContentType], supported: ", ", ", "")) {
+
+    @deprecated("for binary compatibility")
+    def this(supported: Set[ContentTypeRange]) = this(supported, None)
+
+    @deprecated("for binary compatibility")
+    def copy(supported: Set[ContentTypeRange]): UnsupportedContentTypeException =
+      new UnsupportedContentTypeException(supported, this.actualContentType)
+
+    @deprecated("for binary compatibility")
+    def copy$default$1(supported: Set[ContentTypeRange]): UnsupportedContentTypeException =
+      new UnsupportedContentTypeException(supported, this.actualContentType)
+
+    @deprecated("for binary compatibility")
+    def copy(
+      supported:   Set[ContentTypeRange] = this.supported,
+      contentType: Option[ContentType]   = this.actualContentType): UnsupportedContentTypeException =
+      new UnsupportedContentTypeException(supported, contentType)
   }
+
+  object UnsupportedContentTypeException {
+
+    def apply(supported: ContentTypeRange*): UnsupportedContentTypeException =
+      new UnsupportedContentTypeException(Set(supported: _*), None)
+
+    def apply(supported: Set[ContentTypeRange]): UnsupportedContentTypeException =
+      new UnsupportedContentTypeException(supported, None)
+
+    def apply(contentType: Option[ContentType], supported: ContentTypeRange*): UnsupportedContentTypeException =
+      UnsupportedContentTypeException(Set(supported: _*), contentType)
+  }
+
 }
