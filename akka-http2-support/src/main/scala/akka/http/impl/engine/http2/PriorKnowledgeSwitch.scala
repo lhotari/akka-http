@@ -4,14 +4,8 @@
 
 package akka.http.impl.engine.http2
 
-import javax.net.ssl.SSLException
-
 import akka.util.ByteString
-import akka.NotUsed
 import akka.annotation.InternalApi
-import akka.http.impl.engine.server.HttpAttributes
-import akka.http.scaladsl.model.{ HttpRequest, HttpResponse }
-import akka.stream.TLSProtocol.{ SessionBytes, SessionTruncated, SslTlsInbound, SslTlsOutbound }
 import akka.stream.scaladsl.Flow
 import akka.stream.stage.{ GraphStage, GraphStageLogic, InHandler, OutHandler }
 import akka.stream._
@@ -19,10 +13,8 @@ import akka.stream._
 /** INTERNAL API */
 @InternalApi
 private[http] object PriorKnowledgeSwitch {
-  type HttpServerFlow = Flow[ByteString, ByteString, NotUsed]
+  type HttpServerFlow = Flow[ByteString, ByteString, _]
   type HttpServerShape = FlowShape[ByteString, ByteString]
-
-  private final val HTTP2_CONNECTION_PREFACE = ByteString("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 
   def apply(
     http1Stack: HttpServerFlow,
@@ -52,13 +44,14 @@ private[http] object PriorKnowledgeSwitch {
             private[this] var grabbed = ByteString.empty
             def onPush(): Unit = {
               val data = grabbed ++ grab(netIn)
-              if (data.length >= HTTP2_CONNECTION_PREFACE.length) { // We should know by now
-                if (data.startsWith(HTTP2_CONNECTION_PREFACE, 0))
+              if (data.length >= Http2Protocol.ClientConnectionPreface.length) { // We should know by now
+                if (data.startsWith(Http2Protocol.ClientConnectionPreface, 0))
                   install(http2Stack, data)
                 else
                   install(http1Stack, data)
-              } else if (data.isEmpty || data.startsWith(HTTP2_CONNECTION_PREFACE, 0)) { // Still unknown
+              } else if (data.isEmpty || Http2Protocol.ClientConnectionPreface.startsWith(data)) { // Still unknown
                 grabbed = data
+                pull(netIn)
               } else { // Not a Prior Knowledge request
                 install(http1Stack, data)
               }
